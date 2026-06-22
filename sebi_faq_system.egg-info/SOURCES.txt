@@ -1,0 +1,8 @@
+README.md
+pyproject.toml
+frontend/node_modules/flatted/python/flatted.py
+sebi_faq_system.egg-info/PKG-INFO
+sebi_faq_system.egg-info/SOURCES.txt
+sebi_faq_system.egg-info/dependency_links.txt
+sebi_faq_system.egg-info/requires.txt
+sebi_faq_system.egg-info/top_level.txt

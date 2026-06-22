@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120">
+  <!-- Efficore mark — white tile + emerald check. For dark / indigo backgrounds (sidebar, topbar). -->
+  <rect x="10" y="10" width="100" height="100" rx="26" fill="#FFFFFF"/>
+  <path d="M 36 62 L 53 79 L 85 41" fill="none" stroke="#10B981" stroke-width="13" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
