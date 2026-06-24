@@ -35,7 +35,7 @@ import {
 } from 'lucide-react'
 import './App.css'
 
-const API_BASE = 'http://sebi.nawaz.app/api/v1'
+const API_BASE = 'https://sebi.nawaz.app/api/v1'
 
 function App() {
   // Navigation & View states
@@ -369,7 +369,7 @@ function App() {
   // Check server status
   const checkServer = async () => {
     try {
-      const res = await fetch('http://sebi.nawaz.app/health')
+      const res = await fetch('https://sebi.nawaz.app/health')
       if (res.ok) {
         setServerOnline(true)
       } else {
