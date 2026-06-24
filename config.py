@@ -8,11 +8,18 @@ from dotenv import load_dotenv
 # Explicitly load environment variables from .env
 load_dotenv()
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
 
 
 class Settings(BaseSettings):
+    @field_validator('database_url', mode='before')
+    @classmethod
+    def convert_postgres_scheme(cls, v: str) -> str:
+        if v and v.startswith("postgres://"):
+            return v.replace("postgres://", "postgresql://", 1)
+        return v
     # App
     app_name: str = "SEBI FAQ Intelligent System"
     app_version: str = "0.1.0"

@@ -11,7 +11,7 @@ from datetime import datetime
 from models import FAQ, FAQMetadata, SearchLog, FAQVersion
 from schemas import (
     SemanticSearchRequest, MetadataFilterRequest, FullTextSearchRequest,
-    CombinedSearchRequest, SearchResult, SearchResponse
+    CombinedSearchRequest, SearchResult, SearchResponse, FAQResponse, MetadataResponse
 )
 from embeddings import get_embedding_service
 from vector_db import get_vector_db
@@ -473,7 +473,6 @@ class SearchService:
     
     def _faq_to_response(self, faq: FAQ) -> FAQResponse:
         """Convert FAQ model to response dict"""
-        from schemas import FAQResponse, MetadataResponse
         
         metadata_entries = [
             MetadataResponse(
