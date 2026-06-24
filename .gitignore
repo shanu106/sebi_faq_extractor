@@ -1,0 +1,6 @@
+.env
+.env.example
+venv/
+verify_system.py
+verify_system.sh
+sebi_faqs_extracted.json
