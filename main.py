@@ -49,7 +49,7 @@ app = FastAPI(
 
 # CORS middleware
 origins = list(settings.cors_origins)
-for origin in ["https://shanu106.github.io/sebi_faq_extractor/","https://efficoresebi.netlify.app/", "https://shanu106.github.io"]:
+for origin in ["https://shanu106.github.io/sebi_faq_extractor/","https://sebifaq.nawaz.app/","https://efficoresebi.netlify.app/", "https://shanu106.github.io"]:
     if origin not in origins:
         origins.append(origin)
 
