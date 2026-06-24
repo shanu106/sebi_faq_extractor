@@ -35,7 +35,7 @@ import {
 } from 'lucide-react'
 import './App.css'
 
-const API_BASE = 'http://18.205.17.1:8000/api/v1'
+const API_BASE = 'http://54.163.220.52:8000/api/v1'
 
 function App() {
   // Navigation & View states
@@ -369,7 +369,7 @@ function App() {
   // Check server status
   const checkServer = async () => {
     try {
-      const res = await fetch('http://18.205.17.1:8000/health')
+      const res = await fetch('http://54.163.220.52:8000/health')
       if (res.ok) {
         setServerOnline(true)
       } else {
