@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     # Embeddings
     embedding_model: str = "all-MiniLM-L6-v2"  # Fast, efficient model
     embedding_dimension: int = 384
+    hf_hub_offline: bool = False
     
     # API
     api_prefix: str = "/api/v1"

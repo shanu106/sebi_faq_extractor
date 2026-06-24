@@ -3,10 +3,13 @@ Embedding generation service
 """
 
 import os
-os.environ["HF_HUB_OFFLINE"] = "1"
+from config import settings
+if settings.hf_hub_offline:
+    os.environ["HF_HUB_OFFLINE"] = "1"
+else:
+    os.environ.pop("HF_HUB_OFFLINE", None)
 
 from sentence_transformers import SentenceTransformer
-from config import settings
 import logging
 from typing import List
 

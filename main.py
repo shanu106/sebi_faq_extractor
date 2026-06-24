@@ -3,7 +3,11 @@ FastAPI main application
 """
 
 import os
-os.environ["HF_HUB_OFFLINE"] = "1"
+from config import settings
+if settings.hf_hub_offline:
+    os.environ["HF_HUB_OFFLINE"] = "1"
+else:
+    os.environ.pop("HF_HUB_OFFLINE", None)
 
 from fastapi import FastAPI, HTTPException, Depends, Query, BackgroundTasks, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
