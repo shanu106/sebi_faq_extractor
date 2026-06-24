@@ -48,9 +48,14 @@ app = FastAPI(
 )
 
 # CORS middleware
+origins = list(settings.cors_origins)
+for origin in ["https://shanu106.github.io/sebi_faq_extractor/", "https://shanu106.github.io"]:
+    if origin not in origins:
+        origins.append(origin)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins,
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
