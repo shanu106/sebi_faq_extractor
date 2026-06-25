@@ -112,21 +112,80 @@ def extract_pdf_links_from_csv(file_contents: bytes) -> List[str]:
 
 def scrape_faqs_from_pdf_bytes(pdf_bytes: bytes, source_url: Optional[str] = None) -> List[Dict[str, Any]]:
     """
-    Parses questions and answers (FAQs) from raw PDF bytes.
-    Uses robust boundary splitting based on sequential numbers and question mark index.
-    Falls back to regex-based parser if sequential extraction is not applicable.
+    Multi-strategy FAQ extraction from PDF bytes.
+    
+    Strategies (applied in order, results merged):
+      1. Numbered questions: Lines starting with N. / QN. with gap-tolerant sequencing
+      2. Bold text detection: Uses pdfplumber font metadata to find bold question lines
+      3. Question-mark detection: Lines ending with '?' even without serial numbers
+      4. Regex fallback: Pattern-matching Q/A markers for unstructured PDFs
     """
-    try:
-        pdf_reader = PyPDF2.PdfReader(BytesIO(pdf_bytes))
-        text = ""
-        for page in pdf_reader.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
-    except Exception as e:
-        logger.error(f"Failed to parse PDF pages: {e}")
-        raise RuntimeError(f"PDF parsing error: {str(e)}")
 
+    # =====================================================================
+    # STEP 1: TEXT EXTRACTION (pdfplumber primary, PyPDF2 fallback)
+    # =====================================================================
+    bold_line_texts: Set[str] = set()  # Set of line-text strings detected as bold
+    text = ""
+
+    # --- Try pdfplumber first (better text extraction + bold detection) ---
+    try:
+        import pdfplumber
+        from collections import defaultdict
+
+        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n"
+
+                # Detect bold lines from character-level font info
+                try:
+                    chars = page.chars
+                    if chars:
+                        y_groups: Dict[int, list] = defaultdict(list)
+                        for c in chars:
+                            y_key = round(c['top'])
+                            y_groups[y_key].append(c)
+
+                        for y_key in sorted(y_groups.keys()):
+                            group_chars = y_groups[y_key]
+                            line_text = ''.join(c['text'] for c in group_chars).strip()
+                            if not line_text or len(line_text) < 5:
+                                continue
+                            non_space = [c for c in group_chars if c['text'].strip()]
+                            if non_space:
+                                bold_count = sum(
+                                    1 for c in non_space
+                                    if any(w in c.get('fontname', '').lower() for w in ['bold', 'black', 'heavy', 'semibold', 'demibold'])
+                                )
+                                if bold_count > len(non_space) * 0.5:
+                                    bold_line_texts.add(line_text)
+                except Exception:
+                    pass  # Bold detection is best-effort
+    except ImportError:
+        logger.info("pdfplumber not available, falling back to PyPDF2 (no bold detection)")
+    except Exception as e:
+        logger.warning(f"pdfplumber extraction failed ({e}), falling back to PyPDF2")
+
+    # --- Fallback to PyPDF2 if pdfplumber yielded nothing ---
+    if not text.strip():
+        try:
+            pdf_reader = PyPDF2.PdfReader(BytesIO(pdf_bytes))
+            for page in pdf_reader.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n"
+        except Exception as e:
+            logger.error(f"Failed to parse PDF pages: {e}")
+            raise RuntimeError(f"PDF parsing error: {str(e)}")
+
+    if not text.strip():
+        logger.warning("No text could be extracted from PDF")
+        return []
+
+    # =====================================================================
+    # STEP 2: HELPER FUNCTIONS
+    # =====================================================================
     faqs: List[Dict[str, Any]] = []
     seen_questions: Set[str] = set()
 
@@ -143,8 +202,8 @@ def scrape_faqs_from_pdf_bytes(pdf_bytes: bytes, source_url: Optional[str] = Non
             start_idx = match.start()
             if start_idx > 0:
                 q_clean = q_clean[start_idx:]
-        # Strip leading Q/number markers
-        q_clean = re.sub(r'^\s*(?:Q\d+\.?|Q\.?\s*\d+\.?|\d+\.?|[Qq]uestion\s*\d+\.?)\s*', '', q_clean)
+        # Strip leading Q/number markers (e.g. "Q1.", "1.", "1.1", "Question 1.")
+        q_clean = re.sub(r'^\s*(?:Q\d+\.?|Q\.?\s*\d+\.?|\d+(?:\.\d+)?\.?|[Qq]uestion\s*\d+\.?)\s*', '', q_clean)
         return q_clean.strip()
 
     def clean_answer_text(a: str) -> str:
@@ -154,110 +213,299 @@ def scrape_faqs_from_pdf_bytes(pdf_bytes: bytes, source_url: Optional[str] = Non
         return a_clean.strip()
 
     def extract_question_number(line_str: str) -> Optional[int]:
-        match = re.match(r'^\s*(?:[Qq](?:uestion)?\.?\s*)?(\d+)(?:[\.\s:-]+|$)', line_str)
+        """Extract a leading question number from a line (e.g. '1.', 'Q1.', '1.1', '(1)', '1)')."""
+        match = re.match(r'^\s*(?:[Qq](?:uestion)?\.?\s*)?\(?(\d+)\)?(?:[\.:\s\)-]+|$)', line_str)
         if match:
-            return int(match.group(1))
+            num = int(match.group(1))
+            if num < 500:  # Restrict to avoid matching large numbers or years
+                return num
         return None
 
-    # Pre-split text into lines for structured parsing
-    raw_lines = [line.strip() for line in text.split('\n')]
-    lines = []
+    def has_question_word(text_str: str) -> bool:
+        """Check if text contains question indicator words (using word boundaries)."""
+        lower = re.sub(r'^\s*\d+[\.\)\s]+', '', text_str).strip().lower()
+        pattern = r'\b(what|how|why|when|where|who|which|can|does|do|is|are|shall|should|will|whether|has|have|had|did|could|would|may|if|whoever|whom)\b'
+        return bool(re.search(pattern, lower))
 
-    # Pre-process lines: Clean page headers/footers
+    def is_bold_line(line_text: str) -> bool:
+        """Check if a cleaned line matches any detected bold text from pdfplumber."""
+        if not bold_line_texts:
+            return False
+        clean = line_text.strip()
+        if len(clean) < 5:
+            return False
+        for bt in bold_line_texts:
+            # Fuzzy match: the cleaned line may have slightly different whitespace
+            # than the bold text from pdfplumber, so check containment both ways
+            if clean == bt:
+                return True
+            # Normalize whitespace for comparison
+            clean_norm = ' '.join(clean.split())
+            bt_norm = ' '.join(bt.split())
+            if clean_norm == bt_norm:
+                return True
+            if len(clean_norm) > 15 and (clean_norm in bt_norm or bt_norm in clean_norm):
+                return True
+        return False
+
+    def is_likely_question_start(line: str) -> bool:
+        """
+        Determine if a line is likely the start of a FAQ question.
+        Uses multiple signals: numbering, question mark, question words, bold text.
+        """
+        has_qmark = '?' in line
+        has_num = extract_question_number(line) is not None
+        has_qword = has_question_word(line)
+        bold = is_bold_line(line)
+
+        # Strong: numbered line + question mark
+        if has_num and has_qmark:
+            return True
+        # Strong: bold text + (question mark OR question word)
+        if bold and (has_qmark or has_qword):
+            return True
+        # Moderate: question mark + question word (for unnumbered questions)
+        if has_qmark and has_qword and len(line.strip()) > 20:
+            return True
+        return False
+
+    # =====================================================================
+    # STEP 3: LINE CLEANING (remove headers/footers, handle page breaks)
+    # =====================================================================
+    raw_lines = [line.strip() for line in text.split('\n')]
+    lines: List[str] = []
+
     header_footer_patterns = [
-        r'SEBI\s+FAQs\s+on\s+.*?\s+Page\s+\d+\s+of\s+\d+',
-        r'Page\s+\d+\s+of\s+\d+',
+        r'SEBI\s+FAQs?\s+on\s+.*?\s+Page\s+\d+\s+of\s+\d+',
+        r'^Page\s+\d+\s+of\s+\d+\s*$',
         r'^\d+\s+of\s+\d+$',
-        r'Frequently\s+Asked\s+Questions\s+on\s+.*',
+        r'^Frequently\s+Asked\s+Questions?\s+on\s+.*',
+        r'^Frequently\s+Asked\s+Questions?\s*$',
+        r'^FAQs?\s*$',
     ]
 
     for line in raw_lines:
+        # Skip pure header/footer lines
         is_hf = False
         for pat in header_footer_patterns:
             if re.search(pat, line, re.IGNORECASE):
                 is_hf = True
                 break
-        
-        # Extract question portion if page header is prepended to a question
-        header_match = re.search(r'^(.*?Page\s+\d+\s+of\s+\d+)\s*(?:[A-Za-z]+\s+\d+\s*,\s*\d+)?\s*', line, re.IGNORECASE)
+
+        # Handle lines where a page header is prepended to content
+        # e.g. "Page 3 of 10 September 24, 2024 12. What is..."
+        header_match = re.search(
+            r'^(.*?Page\s+\d+\s+of\s+\d+)\s*(?:[A-Za-z]+\s+\d+\s*,\s*\d+)?\s*',
+            line, re.IGNORECASE
+        )
         if header_match:
             cleaned = line[header_match.end():].strip()
             if cleaned:
                 lines.append(cleaned)
             continue
-            
+
         if not is_hf:
             lines.append(line)
 
-    # Find question start indices using sequential number matching + lookahead
-    question_start_indices = []
-    expected_next_num = 1
+    if bold_line_texts:
+        logger.info(f"Bold detection: found {len(bold_line_texts)} bold text segments in PDF")
 
+    # =====================================================================
+    # STEP 4: MULTI-STRATEGY QUESTION BOUNDARY DETECTION
+    # =====================================================================
+
+    # --- Strategy 1: Numbered questions with gap-tolerant sequencing ---
+    numbered_candidates: List[tuple] = []  # (line_index, question_number)
     for idx, line in enumerate(lines):
         num = extract_question_number(line)
-        if num == expected_next_num:
-            # Lookahead to see if there is a question mark before next number or within next 10 lines
-            has_qmark = False
-            for look_idx in range(idx, min(len(lines), idx + 10)):
-                if look_idx > idx:
-                    next_num = extract_question_number(lines[look_idx])
-                    if next_num is not None:
-                        break
+        if num is not None and num >= 1:
+            # Check for question mark on this line or within next few lines
+            # (stop scanning if we hit another numbered line first)
+            has_qmark_nearby = False
+            for look_idx in range(idx, min(len(lines), idx + 6)):
                 if '?' in lines[look_idx]:
-                    has_qmark = True
+                    has_qmark_nearby = True
                     break
-            
-            if has_qmark:
-                question_start_indices.append(idx)
-                expected_next_num = num + 1
+                if look_idx > idx and extract_question_number(lines[look_idx]) is not None:
+                    break  # Hit another numbered line — stop
 
-    # Extract Q&As using the identified boundary indexes
-    if question_start_indices:
-        for i in range(len(question_start_indices)):
-            start_idx = question_start_indices[i]
-            end_idx = question_start_indices[i+1] if i + 1 < len(question_start_indices) else len(lines)
-            
-            block_lines = lines[start_idx : end_idx]
-            
-            # Find the last line containing '?' in the first few lines of the block (up to 8 lines)
+            if has_qmark_nearby:
+                numbered_candidates.append((idx, num))
+
+    # Build monotonically increasing sequence with gap tolerance (MAX_GAP)
+    question_start_indices: List[int] = []
+    if numbered_candidates:
+        MAX_GAP = 5  # Allow skipping up to 5 missing question numbers
+        last_num = 0
+        for (idx, num) in numbered_candidates:
+            if num > last_num and num <= last_num + MAX_GAP:
+                question_start_indices.append(idx)
+                last_num = num
+            # If num resets to a small value while we're deep in the sequence,
+            # it's answer sub-numbering (e.g. "1. Brokerage charges..." inside Q20)
+            # — just skip it silently
+
+    # --- Strategy 2: Bold text questions not already in numbered set ---
+    bold_boundaries: List[int] = []
+    numbered_set = set(question_start_indices)
+    if bold_line_texts:
+        for idx, line in enumerate(lines):
+            if idx in numbered_set:
+                continue
+            is_bold = is_bold_line(line)
+            if is_bold:
+                is_candidate = False
+                stripped = line.strip()
+                if has_question_word(stripped) or '?' in stripped:
+                    is_candidate = True
+                elif len(stripped) >= 10 and len(stripped) <= 150:
+                    # Allow standalone bold lines as topic headings/questions
+                    is_candidate = True
+
+                if is_candidate:
+                    # Guard: Check if the line is part of a multi-line numbered question
+                    inside_question_part = False
+                    for q_start in question_start_indices:
+                        if q_start <= idx:
+                            q_end = next((s for s in question_start_indices if s > q_start), len(lines))
+                            if idx < q_end:
+                                block_lines = lines[q_start:q_end]
+                                qmark_line_idx = -1
+                                for k in range(min(len(block_lines), 5)):
+                                    if '?' in block_lines[k]:
+                                        qmark_line_idx = k
+                                        break
+                                if qmark_line_idx != -1 and idx <= q_start + qmark_line_idx:
+                                    inside_question_part = True
+                                break
+                    if inside_question_part:
+                        continue
+
+                    # Make sure this bold line isn't deeply inside an existing Q&A block
+                    # (i.e. it's not just a bold sub-heading within an answer)
+                    inside_existing = False
+                    for qi, q_start in enumerate(question_start_indices):
+                        q_end = question_start_indices[qi + 1] if qi + 1 < len(question_start_indices) else len(lines)
+                        if q_start < idx < q_end:
+                            # It's inside an existing block — only add if it has strong signals
+                            if '?' in line and has_question_word(line):
+                                # Strong enough to be a standalone question within a block
+                                pass
+                            else:
+                                inside_existing = True
+                            break
+                    if not inside_existing:
+                        bold_boundaries.append(idx)
+
+    # --- Strategy 3: Standalone question-mark lines not already detected ---
+    qmark_boundaries: List[int] = []
+    all_so_far = set(question_start_indices) | set(bold_boundaries)
+    for idx, line in enumerate(lines):
+        if idx in all_so_far:
+            continue
+        stripped = line.strip()
+        # Relax to match any standalone line ending with a question mark
+        if stripped.endswith('?') and len(stripped) >= 10:
+            # Guard: Check if the line is part of a multi-line numbered question
+            inside_question_part = False
+            for q_start in question_start_indices:
+                if q_start <= idx:
+                    q_end = next((s for s in question_start_indices if s > q_start), len(lines))
+                    if idx < q_end:
+                        block_lines = lines[q_start:q_end]
+                        qmark_line_idx = -1
+                        for k in range(min(len(block_lines), 5)):
+                            if '?' in block_lines[k]:
+                                qmark_line_idx = k
+                                break
+                        if qmark_line_idx != -1 and idx <= q_start + qmark_line_idx:
+                            inside_question_part = True
+                        break
+            if inside_question_part:
+                continue
+
+            # Verify it's not a sub-question inside an existing answer
+            # by checking if the NEXT significant content looks like an answer (no '?')
+            is_answer_subq = False
+            for qi, q_start in enumerate(question_start_indices):
+                q_end = question_start_indices[qi + 1] if qi + 1 < len(question_start_indices) else len(lines)
+                if q_start < idx < q_end:
+                    # Check if this looks like a distinct Q&A (has answer content after it)
+                    remaining_lines = q_end - idx - 1
+                    if remaining_lines < 2:
+                        is_answer_subq = True  # Too close to next boundary
+                    break
+            if not is_answer_subq:
+                qmark_boundaries.append(idx)
+
+    # --- Merge all boundaries ---
+    all_boundaries = sorted(set(question_start_indices + bold_boundaries + qmark_boundaries))
+
+    logger.info(
+        f"PDF extraction: {len(all_boundaries)} question boundaries found "
+        f"({len(question_start_indices)} numbered, {len(bold_boundaries)} bold, "
+        f"{len(qmark_boundaries)} question-mark) in {len(lines)} lines"
+    )
+
+    # =====================================================================
+    # STEP 5: EXTRACT Q&A PAIRS FROM BOUNDARIES
+    # =====================================================================
+    if all_boundaries:
+        for i in range(len(all_boundaries)):
+            start_idx = all_boundaries[i]
+            end_idx = all_boundaries[i + 1] if i + 1 < len(all_boundaries) else len(lines)
+
+            block_lines = lines[start_idx:end_idx]
+            if not block_lines:
+                continue
+
+            # ----------------------------------------------------------
+            # Find where the question ends: use the FIRST '?' in the
+            # first few lines (not the last). This prevents sub-questions
+            # inside the answer from being absorbed into the question text.
+            # ----------------------------------------------------------
             qmark_line_idx = -1
-            for k in range(min(len(block_lines), 8)):
+            for k in range(min(len(block_lines), 5)):
                 if '?' in block_lines[k]:
                     qmark_line_idx = k
-            
+                    break  # FIRST '?' = end of question
+
             if qmark_line_idx != -1:
-                # Split the line containing '?' at the last '?'
                 target_line = block_lines[qmark_line_idx]
-                split_idx = target_line.rfind('?')
+                # Find the FIRST '?' in the target line that completes the question
+                split_idx = target_line.index('?')
                 q_line_end = target_line[:split_idx + 1]
                 a_line_start = target_line[split_idx + 1:].strip()
-                
-                # Assemble question and answer text
+
+                # Assemble question text (lines before qmark + qmark line up to '?')
                 q_text = " ".join(block_lines[:qmark_line_idx]) + " " + q_line_end
+
+                # Assemble answer text (rest of qmark line + remaining lines)
                 a_text_parts = []
                 if a_line_start:
                     a_text_parts.append(a_line_start)
                 a_text_parts.extend(block_lines[qmark_line_idx + 1:])
-                a_text = " ".join(a_text_parts)
             else:
-                # Fallback if no question mark is found in the first 8 lines
+                # No question mark found — treat first line as question
                 q_text = block_lines[0]
-                a_text = " ".join(block_lines[1:])
-            
+                a_text_parts = block_lines[1:]
+
             q_cleaned = clean_text(clean_question_text(q_text))
-            a_cleaned = clean_text(clean_answer_text(a_text))
-            
-            # Filter page numbers and headers from answers
-            filtered_ans = []
-            for line in a_cleaned.split('\n'):
-                line_str = line.strip()
-                if re.search(r'Page \d+ of \d+', line_str, re.I) or re.search(r'^\d+ of \d+$', line_str):
+
+            # Filter residual page numbers / headers from answer text parts BEFORE joining
+            filtered_parts = []
+            for part in a_text_parts:
+                part_str = part.strip()
+                if re.search(r'Page \d+ of \d+', part_str, re.I):
                     continue
-                if 'sebi' in line_str.lower() and 'faq' in line_str.lower():
+                if re.search(r'^\d+ of \d+$', part_str):
                     continue
-                filtered_ans.append(line_str)
-            a_cleaned = " ".join(filtered_ans).strip()
-            
+                if re.match(r'^\s*SEBI\s+FAQs?\s*$', part_str, re.I) or re.match(r'^\s*FAQs?\s+on\s+.*$', part_str, re.I):
+                    continue
+                filtered_parts.append(part_str)
+            a_cleaned = clean_text(clean_answer_text(" ".join(filtered_parts)))
+
+            # Quality gate: question ≥ 10 chars, answer ≥ 20 chars
             if len(q_cleaned) >= 10 and len(a_cleaned) >= 20:
                 q_lower = q_cleaned.lower()
                 if q_lower not in seen_questions:
@@ -268,27 +516,30 @@ def scrape_faqs_from_pdf_bytes(pdf_bytes: bytes, source_url: Optional[str] = Non
                         "source_url": source_url
                     })
 
-    # Fallback to Regex-based parsing if no structured Q&As extracted (e.g. unnumbered pages)
+    # =====================================================================
+    # STEP 6: FALLBACK — regex-based extraction for unstructured PDFs
+    # =====================================================================
     if len(faqs) < 2:
         faqs.clear()
         seen_questions.clear()
         qa_pattern = r'[Qq]\.?\s*([^\n?]+\?)\s*[Aa]\.?\s*([^\n]+(?:\n(?!Q\.)[^\n]+)*)'
         matches = re.findall(qa_pattern, text)
         for q, a in matches:
-            q_cleaned = clean_text(clean_question_text(q))
-            a_cleaned = clean_text(clean_answer_text(a))
-            
-            # Filter page numbers and headers
-            filtered_ans = []
-            for line in a_cleaned.split('\n'):
+            # Filter line-by-line BEFORE clean_text replaces newlines
+            filtered_parts = []
+            for line in a.split('\n'):
                 line_str = line.strip()
-                if re.search(r'Page \d+ of \d+', line_str, re.I) or re.search(r'^\d+ of \d+$', line_str):
+                if re.search(r'Page \d+ of \d+', line_str, re.I):
                     continue
-                if 'sebi' in line_str.lower() and 'faq' in line_str.lower():
+                if re.search(r'^\d+ of \d+$', line_str):
                     continue
-                filtered_ans.append(line_str)
-            a_cleaned = " ".join(filtered_ans).strip()
-            
+                if re.match(r'^\s*SEBI\s+FAQs?\s*$', line_str, re.I) or re.match(r'^\s*FAQs?\s+on\s+.*$', line_str, re.I):
+                    continue
+                filtered_parts.append(line_str)
+
+            q_cleaned = clean_text(clean_question_text(q))
+            a_cleaned = clean_text(clean_answer_text(" ".join(filtered_parts)))
+
             if len(q_cleaned) >= 10 and len(a_cleaned) >= 20:
                 q_lower = q_cleaned.lower()
                 if q_lower not in seen_questions:
@@ -298,7 +549,6 @@ def scrape_faqs_from_pdf_bytes(pdf_bytes: bytes, source_url: Optional[str] = Non
                         "answer": a_cleaned,
                         "source_url": source_url
                     })
-
 
     return faqs
 
