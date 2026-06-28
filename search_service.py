@@ -2,8 +2,8 @@
 Search service - handles semantic, metadata, and full-text search
 """
 
-from sqlalchemy.orm import Session
-from sqlalchemy import and_, or_, func, desc
+from sqlalchemy.orm import Session, selectinload
+from sqlalchemy import and_, or_, func, desc, cast, String
 import logging
 from typing import List, Dict, Any, Tuple, Optional
 from datetime import datetime
@@ -35,42 +35,52 @@ class SearchService:
         if not faqs:
             return []
             
-        unique_faqs = {}
+        # Group FAQs in memory to avoid N+1 queries.
+        # Since the input faqs are already active FAQs, the latest active record
+        # for a given key is simply the one with the latest document_publish_date.
+        temp_groups = {}
         for faq in faqs:
             q_norm = faq.question.strip().lower()
             cat_norm = (faq.category or "").strip().lower()
             key = (q_norm, cat_norm)
             
-            if key not in unique_faqs:
-                # Find the active FAQ for this question and category combination
-                active_faq = self.db.query(FAQ).filter(
-                    and_(
-                        func.lower(FAQ.question) == q_norm,
-                        func.coalesce(func.lower(FAQ.category), '') == cat_norm,
-                        FAQ.is_active == True
-                    )
-                ).order_by(FAQ.document_publish_date.desc().nullslast()).first()
+            if key not in temp_groups:
+                temp_groups[key] = faq
+            else:
+                existing = temp_groups[key]
+                existing_date = existing.document_publish_date or datetime.min
+                current_date = faq.document_publish_date or datetime.min
+                if current_date > existing_date:
+                    temp_groups[key] = faq
+                    
+        unique_faqs = list(temp_groups.values())
+        
+        # Batch fetch all version histories for unique active FAQs in a single query
+        faq_ids = [faq.id for faq in unique_faqs]
+        versions_by_faq = {}
+        if faq_ids:
+            all_versions = self.db.query(FAQVersion).filter(
+                FAQVersion.faq_id.in_(faq_ids)
+            ).order_by(FAQVersion.version_number.desc()).all()
+            
+            for v in all_versions:
+                if v.faq_id not in versions_by_faq:
+                    versions_by_faq[v.faq_id] = []
+                versions_by_faq[v.faq_id].append(v)
                 
-                if active_faq:
-                    # Query all versions for this active_faq.id from FAQVersion table
-                    versions = self.db.query(FAQVersion).filter(
-                        FAQVersion.faq_id == active_faq.id
-                    ).order_by(FAQVersion.version_number.desc()).all()
-                    
-                    if versions:
-                        max_version_num = max(v.version_number for v in versions)
-                        # Historical answers are the ones with version_number < max_version_num
-                        active_faq.historical_answers = [
-                            v for v in versions if v.version_number < max_version_num
-                        ]
-                    else:
-                        active_faq.historical_answers = []
-                        
-                    unique_faqs[key] = active_faq
-                    
-        processed = list(unique_faqs.values())
-        processed.sort(key=lambda x: x.document_publish_date or datetime.min, reverse=True)
-        return processed
+        # Attach versions
+        for faq in unique_faqs:
+            versions = versions_by_faq.get(faq.id, [])
+            if versions:
+                max_version_num = max(v.version_number for v in versions)
+                faq.historical_answers = [
+                    v for v in versions if v.version_number < max_version_num
+                ]
+            else:
+                faq.historical_answers = []
+                
+        unique_faqs.sort(key=lambda x: x.document_publish_date or datetime.min, reverse=True)
+        return unique_faqs
     
     def semantic_search(
         self, 
@@ -110,7 +120,7 @@ class SearchService:
                     response_time_ms=self._get_elapsed_ms(start_time),
                 )
             
-            faqs = self.db.query(FAQ).filter(
+            faqs = self.db.query(FAQ).options(selectinload(FAQ.metadata_entries)).filter(
                 and_(FAQ.id.in_(faq_ids), FAQ.is_active == True)
             ).all()
             
@@ -183,36 +193,56 @@ class SearchService:
         start_time = datetime.utcnow()
         
         try:
-            # Build query
-            query = self.db.query(FAQ).join(FAQMetadata)
+            # Build query and eager-load metadata entries to avoid lazy-loading N+1 queries
+            query = self.db.query(FAQ).options(selectinload(FAQ.metadata_entries))
             
             # Apply filters
             filters = []
             filter_summary = {}
             
-            if request.department:
-                filters.append(FAQMetadata.department == request.department)
-                filter_summary["department"] = request.department
+            # Check if any filter needs FAQMetadata join
+            has_metadata_filter = any([
+                request.department, request.category, request.risk_level,
+                request.compliance_status, request.authority, request.compliance_framework,
+                request.custom_filters
+            ])
             
-            if request.category:
-                filters.append(FAQMetadata.category == request.category)
-                filter_summary["category"] = request.category
+            if has_metadata_filter:
+                query = query.join(FAQMetadata)
             
-            if request.risk_level:
-                filters.append(FAQMetadata.risk_level == request.risk_level)
-                filter_summary["risk_level"] = request.risk_level
+            if request.department and request.department.strip():
+                filters.append(func.lower(FAQMetadata.department) == request.department.strip().lower())
+                filter_summary["department"] = request.department.strip()
             
-            if request.compliance_status:
-                filters.append(FAQMetadata.compliance_status == request.compliance_status)
-                filter_summary["compliance_status"] = request.compliance_status
+            if request.category and request.category.strip():
+                filters.append(func.lower(FAQMetadata.category) == request.category.strip().lower())
+                filter_summary["category"] = request.category.strip()
             
-            if request.authority:
-                filters.append(FAQMetadata.authority == request.authority)
-                filter_summary["authority"] = request.authority
+            if request.risk_level and request.risk_level.strip():
+                filters.append(func.lower(FAQMetadata.risk_level) == request.risk_level.strip().lower())
+                filter_summary["risk_level"] = request.risk_level.strip()
             
-            if request.compliance_framework:
-                filters.append(FAQMetadata.compliance_framework == request.compliance_framework)
-                filter_summary["compliance_framework"] = request.compliance_framework
+            if request.compliance_status and request.compliance_status.strip():
+                filters.append(func.lower(FAQMetadata.compliance_status) == request.compliance_status.strip().lower())
+                filter_summary["compliance_status"] = request.compliance_status.strip()
+            
+            if request.authority and request.authority.strip():
+                filters.append(func.lower(FAQMetadata.authority) == request.authority.strip().lower())
+                filter_summary["authority"] = request.authority.strip()
+            
+            if request.compliance_framework and request.compliance_framework.strip():
+                filters.append(func.lower(FAQMetadata.compliance_framework) == request.compliance_framework.strip().lower())
+                filter_summary["compliance_framework"] = request.compliance_framework.strip()
+                
+            if request.custom_filters:
+                for k, v in request.custom_filters.items():
+                    if v is not None:
+                        if isinstance(v, str):
+                            val_str = v.strip().lower()
+                            filters.append(func.lower(FAQMetadata.custom_attributes[k].as_string()) == val_str)
+                        else:
+                            filters.append(FAQMetadata.custom_attributes[k] == v)
+                        filter_summary[k] = v
             
             if request.is_verified is not None:
                 filters.append(FAQ.is_verified == request.is_verified)
@@ -222,6 +252,7 @@ class SearchService:
                 query = query.filter(and_(*filters))
             
             query = query.filter(FAQ.is_active == True)
+            query = query.limit(limit)
             faqs = query.all()
             
             # Group, find latest versions and historical versions
@@ -298,7 +329,7 @@ class SearchService:
                 )
             
             # Find matching FAQs
-            query = self.db.query(FAQ).filter(
+            query = self.db.query(FAQ).options(selectinload(FAQ.metadata_entries)).filter(
                 and_(and_(*conditions), FAQ.is_active == True)
             ).limit(request.limit)
             
