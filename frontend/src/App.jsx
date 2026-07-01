@@ -370,7 +370,7 @@ function App() {
   // Check server status
   const checkServer = async () => {
     try {
-      const res = await fetch(`${API_BASE}/health`)
+      const res = await fetch(`${import.meta.env.VITE_API_BASE_HEALTH}/health`)
       if (res.ok) {
         setServerOnline(true)
       } else {
